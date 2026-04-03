@@ -1,5 +1,5 @@
 import logging
-from aiogram import Router, types
+from aiogram import Router, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -11,12 +11,14 @@ from services.ollama_client import (
     generate_theory,
     generate_questions_with_answers
 )
-from models.schemas import QuizSessionData, Question
 from services.db_service import (
-    get_user, create_user, create_quiz_attempt, save_answer, finish_quiz_attempt
+    get_user, create_user, create_quiz_attempt, save_answer, finish_quiz_attempt,
+    add_or_update_mistake, count_correct_answers_for_attempt
 )
 from utils.intent_parser import parse_intent
 from keyboards.inline import quiz_control_keyboard
+from models.schemas import QuizSessionData, Question
+
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -34,13 +36,20 @@ async def cancel_quiz(message: types.Message, state: FSMContext):
 
 @router.message()
 async def handle_message(message: types.Message, state: FSMContext):
-    if await state.get_state() == QuizStates.waiting_for_sequential_answer.state:
+    # Игнорируем сообщения, начинающиеся с / (это команды)
+    if message.text and message.text.startswith('/'):
+        return
+    current_state = await state.get_state()
+    if current_state == QuizStates.waiting_for_sequential_answer.state:
         await process_sequential_answer(message, state)
         return
 
     intent, topic, count = parse_intent(message.text)
     if not topic:
-        await message.answer("Не понял тему. Примеры:\n• 4 вопроса по python\n• расскажи про джанго\n• 3 вопроса по js с ответами")
+        await message.answer("Не понял тему. Напишите, например:\n"
+                             "• «4 вопроса по python»\n"
+                             "• «расскажи про джанго»\n"
+                             "• «3 вопроса по js с ответами»")
         return
 
     if intent == "theory":
@@ -49,7 +58,7 @@ async def handle_message(message: types.Message, state: FSMContext):
         if count is None:
             count = 3
         await send_qa(message, topic, count)
-    else:
+    else:  # intent == "quiz"
         if count is None:
             count = 1
         await start_quiz(message, topic, count, state)
@@ -61,7 +70,7 @@ async def start_quiz(message: types.Message, topic: str, count: int, state: FSMC
         questions = await generate_quiz_questions(topic, count)
     except Exception as e:
         logger.exception("Generation failed")
-        await message.answer(f"❌ Ошибка: {e}")
+        await message.answer(f"❌ Ошибка при генерации вопросов: {e}")
         return
 
     user = await get_user(message.from_user.id)
@@ -81,23 +90,37 @@ async def start_quiz(message: types.Message, topic: str, count: int, state: FSMC
     )
     await state.update_data(quiz=session_data.dict())
 
-    if mode == "packet":
-        await start_packet_quiz(message, questions, attempt_id)
+    await start_quiz_session(message, state, session_data)
+
+
+async def start_quiz_session(message: types.Message, state: FSMContext, session_data: QuizSessionData):
+    """Общая функция для запуска викторины (обычный режим или интенсив)"""
+    if session_data.mode == "packet":
+        await start_packet_quiz(message, session_data.questions, session_data.attempt_id, session_data.topic)
     else:
         await start_sequential_quiz(message, state, session_data)
 
 
-async def start_packet_quiz(message: types.Message, questions: list[Question], attempt_id: int):
+async def start_packet_quiz(message: types.Message, questions: list[Question], attempt_id: int, topic: str):
     for i, q in enumerate(questions, 1):
-        await message.answer(f"*{i}. {q.question}*", parse_mode="Markdown")
-    await message.answer("Ответьте одним сообщением на все вопросы.\nЧтобы отменить - /cancel")
+        text = f"*{i}. {q.question}*"
+        await message.answer(text, parse_mode="Markdown")
+    await message.answer(
+        "Ответьте одним сообщением на все вопросы.\n"
+        "Напишите ваши ответы (можно нумерованным списком или просто текст).\n"
+        "Чтобы отменить, используйте /cancel"
+    )
 
 
 async def start_sequential_quiz(message: types.Message, state: FSMContext, session_data: QuizSessionData):
     q = session_data.questions[0]
     total = len(session_data.questions)
     text = f"*Вопрос 1 из {total}:*\n\n{q.question}"
-    await message.answer(text, parse_mode="Markdown", reply_markup=quiz_control_keyboard())
+    await message.answer(
+        text,
+        parse_mode="Markdown",
+        reply_markup=quiz_control_keyboard()
+    )
     await state.set_state(QuizStates.waiting_for_sequential_answer)
 
 
@@ -112,14 +135,31 @@ async def process_sequential_answer(message: types.Message, state: FSMContext):
         result = await verify_answer(question, message.text)
     except Exception as e:
         logger.exception("Verification failed")
-        await message.answer("❌ Ошибка проверки ответа. Попробуйте ещё раз.")
+        await message.answer("❌ Ошибка при проверке ответа. Пожалуйста, попробуйте ещё раз.")
         return
 
     await save_answer(
-        message.from_user.id, attempt_id, question.question,
-        message.text, result.correct, result.explanation
+        message.from_user.id,
+        attempt_id,
+        question.question,
+        message.text,
+        result.correct,
+        result.explanation
     )
-    await message.answer(f"{'✅' if result.correct else '❌'} *Результат:*\n{result.explanation}", parse_mode="Markdown")
+
+    # --- Добавлено: запись ошибки в статистику ---
+    if not result.correct:
+        await add_or_update_mistake(
+            message.from_user.id,
+            question.question,
+            question.correct_answer,
+            session_data.topic
+        )
+
+    await message.answer(
+        f"{'✅' if result.correct else '❌'} *Результат:*\n{result.explanation}",
+        parse_mode="Markdown"
+    )
 
     next_index = current_index + 1
     if next_index < len(session_data.questions):
@@ -127,18 +167,21 @@ async def process_sequential_answer(message: types.Message, state: FSMContext):
         await state.update_data(quiz=session_data.dict())
         q = session_data.questions[next_index]
         text = f"*Вопрос {next_index+1} из {len(session_data.questions)}:*\n\n{q.question}"
-        await message.answer(text, parse_mode="Markdown", reply_markup=quiz_control_keyboard())
+        await message.answer(
+            text,
+            parse_mode="Markdown",
+            reply_markup=quiz_control_keyboard()
+        )
     else:
         await finish_quiz(message, state, session_data, attempt_id)
 
 
 async def finish_quiz(message: types.Message, state: FSMContext, session_data: QuizSessionData, attempt_id: int):
-    from services.db_service import count_correct_answers_for_attempt
     correct_count = await count_correct_answers_for_attempt(attempt_id)
     await finish_quiz_attempt(attempt_id, correct_count)
     await state.clear()
 
-    total = session_data.total_questions if hasattr(session_data, 'total_questions') else len(session_data.questions)
+    total = len(session_data.questions)
     percent = (correct_count / total * 100) if total > 0 else 0
     await message.answer(
         f"✅ Тест завершён!\n"

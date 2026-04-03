@@ -8,6 +8,18 @@ import datetime
 Base = declarative_base()
 
 
+class UserMistake(Base):
+    __tablename__ = 'user_mistakes'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    question_text = Column(String)
+    correct_answer = Column(String)
+    topic = Column(String)
+    mistake_count = Column(Integer, default=1)
+    last_asked = Column(DateTime, default=datetime.datetime.utcnow)
+    user = relationship("User", back_populates="mistakes")
+
+
 class User(Base):
     __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
@@ -17,6 +29,7 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     attempts = relationship("QuizAttempt", back_populates="user")
     answers = relationship("Answer", back_populates="user")
+    mistakes = relationship("UserMistake", back_populates="user")
 
 
 class QuizAttempt(Base):

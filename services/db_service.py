@@ -1,7 +1,7 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import select, update, func
-from models.db_models import User, QuizAttempt, Answer, Base
+from sqlalchemy import select, update, func, delete
+from models.db_models import User, QuizAttempt, Answer, Base, UserMistake
 import datetime
 
 
@@ -130,3 +130,62 @@ async def count_correct_answers_for_attempt(attempt_id: int) -> int:
             )
         )
         return result.scalar() or 0
+
+
+async def add_or_update_mistake(user_telegram_id: int, question_text: str, correct_answer: str, topic: str):
+    async with AsyncSessionLocal() as session:
+        # Сначала получим внутренний user_id
+        user = await get_user(user_telegram_id)
+        if not user:
+            return
+        result = await session.execute(
+            select(UserMistake).where(
+                UserMistake.user_id == user.id,
+                UserMistake.question_text == question_text
+            )
+        )
+        mistake = result.scalar_one_or_none()
+        if mistake:
+            mistake.mistake_count += 1
+            mistake.last_asked = datetime.datetime.utcnow()
+        else:
+            mistake = UserMistake(
+                user_id=user.id,
+                question_text=question_text,
+                correct_answer=correct_answer,
+                topic=topic
+            )
+            session.add(mistake)
+        await session.commit()
+
+async def get_user_mistakes(user_telegram_id: int, topic: str = None, limit: int = 10):
+    async with AsyncSessionLocal() as session:
+        user = await get_user(user_telegram_id)
+        if not user:
+            return []
+        query = select(UserMistake).where(UserMistake.user_id == user.id)
+        if topic:
+            query = query.where(UserMistake.topic.ilike(f"%{topic}%"))
+        query = query.order_by(UserMistake.mistake_count.desc()).limit(limit)
+        result = await session.execute(query)
+        mistakes = result.scalars().all()
+        return [
+            {
+                "question_text": m.question_text,
+                "correct_answer": m.correct_answer,
+                "topic": m.topic,
+                "mistake_count": m.mistake_count
+            }
+            for m in mistakes
+        ]
+
+async def clear_user_mistakes(user_telegram_id: int, topic: str = None):
+    async with AsyncSessionLocal() as session:
+        user = await get_user(user_telegram_id)
+        if not user:
+            return
+        query = delete(UserMistake).where(UserMistake.user_id == user.id)
+        if topic:
+            query = query.where(UserMistake.topic.ilike(f"%{topic}%"))
+        await session.execute(query)
+        await session.commit()
