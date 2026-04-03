@@ -6,12 +6,15 @@ from typing import List
 from models.schemas import Question, VerificationResult
 from config import OLLAMA_URL, OLLAMA_MODEL
 
+
 logger = logging.getLogger(__name__)
+
 
 def clean_json_response(response_text: str) -> str:
     response_text = re.sub(r'```json\s*', '', response_text)
     response_text = re.sub(r'```\s*', '', response_text)
     return response_text.strip()
+
 
 async def generate_quiz_questions(topic: str, count: int) -> List[Question]:
     """Генерирует вопросы с ответами (скрытыми от пользователя)"""
@@ -48,6 +51,7 @@ async def generate_quiz_questions(topic: str, count: int) -> List[Question]:
                 logger.error(f"Ошибка парсинга: {e}\nОтвет: {cleaned}")
                 raise Exception("Ошибка обработки ответа от LLM")
 
+
 async def generate_questions_with_answers(topic: str, count: int) -> List[dict]:
     prompt = f"""Сгенерируй {count} вопросов по теме "{topic}" вместе с правильными ответами.
 Формат: JSON массив объектов с полями "question" и "answer".
@@ -64,6 +68,7 @@ async def generate_questions_with_answers(topic: str, count: int) -> List[dict]:
             except:
                 return []
 
+
 async def generate_theory(topic: str) -> str:
     prompt = f"""Расскажи подробно о теме "{topic}" в формате краткого конспекта для собеседования.
 Выдели основные моменты, определения, примеры. Длина 5-7 абзацев. На русском."""
@@ -72,6 +77,7 @@ async def generate_theory(topic: str) -> str:
         async with session.post(OLLAMA_URL, json=payload) as resp:
             data = await resp.json()
             return data.get("response", "Не удалось сгенерировать теорию.")
+
 
 async def verify_answer(question: Question, user_answer: str) -> VerificationResult:
     prompt = f"""Вопрос: {question.question}
@@ -93,3 +99,44 @@ async def verify_answer(question: Question, user_answer: str) -> VerificationRes
                 return VerificationResult(**result)
             except:
                 return VerificationResult(correct=False, explanation="Ошибка проверки ответа.")
+
+
+async def parse_intent_via_llm(user_text: str) -> dict:
+    """Возвращает словарь с полями: intent, topic, count, with_answers, intensive_topic"""
+    prompt = f"""Проанализируй запрос пользователя и определи его намерение.
+Запрос: "{user_text}"
+
+Верни JSON в точности с полями:
+- intent: одно из "quiz", "qa", "theory", "intensive"
+- topic: строка с темой (например, "python", "django") или пустая строка, если не указана
+- count: целое число (количество вопросов, если указано, иначе null)
+- with_answers: булево (true если пользователь хочет вопросы с ответами, иначе false)
+- intensive_topic: строка (тема для интенсива, если intent="intensive", иначе null)
+
+Примеры:
+"5 вопросов по python" -> {{"intent": "quiz", "topic": "python", "count": 5, "with_answers": false, "intensive_topic": null}}
+"расскажи про джанго" -> {{"intent": "theory", "topic": "django", "count": null, "with_answers": false, "intensive_topic": null}}
+"3 вопроса по js с ответами" -> {{"intent": "qa", "topic": "js", "count": 3, "with_answers": true, "intensive_topic": null}}
+"повтори мои ошибки по python" -> {{"intent": "intensive", "topic": null, "count": null, "with_answers": false, "intensive_topic": "python"}}
+"/intensive" -> {{"intent": "intensive", "topic": null, "count": null, "with_answers": false, "intensive_topic": null}}
+
+Верни только JSON, без пояснений."""
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json"
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(OLLAMA_URL, json=payload) as resp:
+            if resp.status != 200:
+                logger.error(f"Ollama error in intent parsing: {resp.status}")
+                return None
+            data = await resp.json()
+            response_text = data.get("response", "")
+            cleaned = clean_json_response(response_text)
+            try:
+                return json.loads(cleaned)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse intent JSON: {e}\nResponse: {cleaned}")
+                return None

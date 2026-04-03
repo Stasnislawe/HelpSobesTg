@@ -44,7 +44,7 @@ async def handle_message(message: types.Message, state: FSMContext):
         await process_sequential_answer(message, state)
         return
 
-    intent, topic, count = parse_intent(message.text)
+    intent, topic, count = await parse_intent(message.text)
     if not topic:
         await message.answer("Не понял тему. Напишите, например:\n"
                              "• «4 вопроса по python»\n"
