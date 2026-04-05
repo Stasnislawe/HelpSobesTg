@@ -102,25 +102,25 @@ async def verify_answer(question: Question, user_answer: str) -> VerificationRes
 
 
 async def parse_intent_via_llm(user_text: str) -> dict:
-    """Возвращает словарь с полями: intent, topic, count, with_answers, intensive_topic"""
     prompt = f"""Проанализируй запрос пользователя и определи его намерение.
 Запрос: "{user_text}"
 
 Верни JSON в точности с полями:
-- intent: одно из "quiz", "qa", "theory", "intensive"
+- intent: одно из "quiz", "qa", "theory", "explain"
 - topic: строка с темой (например, "python", "django") или пустая строка, если не указана
 - count: целое число (количество вопросов, если указано, иначе null)
 - with_answers: булево (true если пользователь хочет вопросы с ответами, иначе false)
-- intensive_topic: строка (тема для интенсива, если intent="intensive", иначе null)
+- full_question: для intent="explain" – полный текст вопроса, который нужно объяснить; иначе null
 
 Примеры:
-"5 вопросов по python" -> {{"intent": "quiz", "topic": "python", "count": 5, "with_answers": false, "intensive_topic": null}}
-"расскажи про джанго" -> {{"intent": "theory", "topic": "django", "count": null, "with_answers": false, "intensive_topic": null}}
-"3 вопроса по js с ответами" -> {{"intent": "qa", "topic": "js", "count": 3, "with_answers": true, "intensive_topic": null}}
-"повтори мои ошибки по python" -> {{"intent": "intensive", "topic": null, "count": null, "with_answers": false, "intensive_topic": "python"}}
-"/intensive" -> {{"intent": "intensive", "topic": null, "count": null, "with_answers": false, "intensive_topic": null}}
+"5 вопросов по python" -> {{"intent": "quiz", "topic": "python", "count": 5, "with_answers": false, "full_question": null}}
+"расскажи про джанго" -> {{"intent": "theory", "topic": "django", "count": null, "with_answers": false, "full_question": null}}
+"3 вопроса по js с ответами" -> {{"intent": "qa", "topic": "js", "count": 3, "with_answers": true, "full_question": null}}
+"разъясни мне вопрос: в чем разница между Form и ModelForm в Django" -> {{"intent": "explain", "topic": "django", "count": null, "with_answers": false, "full_question": "в чем разница между Form и ModelForm в Django"}}
+"объясни что такое декоратор в python" -> {{"intent": "explain", "topic": "python", "count": null, "with_answers": false, "full_question": "что такое декоратор в python"}}
 
 Верни только JSON, без пояснений."""
+
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
@@ -140,3 +140,15 @@ async def parse_intent_via_llm(user_text: str) -> dict:
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse intent JSON: {e}\nResponse: {cleaned}")
                 return None
+
+
+async def generate_answer_to_question(question: str) -> str:
+    prompt = f"""Ответь на вопрос пользователя максимально подробно и понятно, как опытный разработчик.
+Вопрос: {question}
+
+Дай развёрнутый ответ на русском языке, с примерами кода, если уместно. Не используй Markdown."""
+    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(OLLAMA_URL, json=payload) as resp:
+            data = await resp.json()
+            return data.get("response", "Не удалось сгенерировать ответ.")

@@ -12,7 +12,6 @@ def settings_keyboard(mode: str):
 
 
 def quiz_control_keyboard():
-    """Клавиатура для последовательного режима – только завершение"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Завершить тест", callback_data="finish_quiz")]
     ])

@@ -1,8 +1,9 @@
 from aiogram import Router, types
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery
-from services.db_service import get_user, update_user_settings
+from services.db_service import get_user, update_user_settings, create_user
 from keyboards.inline import settings_keyboard
+from utils.helpers import safe_send
 
 
 router = Router()
@@ -12,11 +13,12 @@ router = Router()
 async def cmd_settings(message: types.Message):
     user = await get_user(message.from_user.id)
     if not user:
-        user = await create_user(message.from_user.id)  # предполагаем, что create_user есть
+        user = await create_user(message.from_user.id)
 
-    await message.answer(
+    await safe_send(
+        message,
         "⚙️ Настройки:",
-        reply_markup=settings_keyboard(user.mode, user.default_question_count)
+        reply_markup=settings_keyboard(user.mode)
     )
 
 
@@ -25,12 +27,12 @@ async def set_mode(callback: CallbackQuery):
     mode = callback.data.split("_")[-1]  # packet или sequential
     await update_user_settings(callback.from_user.id, mode=mode)
     await callback.answer(f"Режим изменён на {'пакетный' if mode == 'packet' else 'последовательный'}")
-    await callback.message.edit_reply_markup(reply_markup=settings_keyboard(mode, 3))  # нужна актуальная клавиатура
+
+    user = await get_user(callback.from_user.id)
+    await callback.message.edit_reply_markup(reply_markup=settings_keyboard(user.mode))
 
 
-@router.callback_query(lambda c: c.data.startswith("set_count_"))
-async def set_count(callback: CallbackQuery):
-    count = int(callback.data.split("_")[-1])
-    await update_user_settings(callback.from_user.id, default_question_count=count)
-    await callback.answer(f"Количество вопросов по умолчанию: {count}")
-    await callback.message.edit_reply_markup(reply_markup=settings_keyboard("packet", count))  # нужно передать текущий режим
+@router.callback_query(lambda c: c.data == "close_settings")
+async def close_settings(callback: CallbackQuery):
+    await callback.message.delete()
+    await callback.answer("Настройки закрыты")
