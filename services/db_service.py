@@ -1,8 +1,9 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import select, update, func, delete
-from models.db_models import User, QuizAttempt, Answer, Base, UserMistake
+from models.db_models import User, QuizAttempt, Answer, Base, UserMistake, UserProgress, LearningPath
 import datetime
+import json
 
 
 DATABASE_URL = "sqlite+aiosqlite:///bot.db"
@@ -158,6 +159,7 @@ async def add_or_update_mistake(user_telegram_id: int, question_text: str, corre
             session.add(mistake)
         await session.commit()
 
+
 async def get_user_mistakes(user_telegram_id: int, topic: str = None, limit: int = 10):
     async with AsyncSessionLocal() as session:
         user = await get_user(user_telegram_id)
@@ -179,6 +181,7 @@ async def get_user_mistakes(user_telegram_id: int, topic: str = None, limit: int
             for m in mistakes
         ]
 
+
 async def clear_user_mistakes(user_telegram_id: int, topic: str = None):
     async with AsyncSessionLocal() as session:
         user = await get_user(user_telegram_id)
@@ -189,3 +192,102 @@ async def clear_user_mistakes(user_telegram_id: int, topic: str = None):
             query = query.where(UserMistake.topic.ilike(f"%{topic}%"))
         await session.execute(query)
         await session.commit()
+
+
+# ---------- Learning Paths ----------
+async def create_learning_path(user_telegram_id: int, topics: list, title: str = None) -> int:
+    user = await get_user(user_telegram_id)
+    if not user:
+        user = await create_user(user_telegram_id)
+    async with AsyncSessionLocal() as session:
+        path = LearningPath(
+            user_id=user.id,
+            topics=json.dumps(topics),
+            title=title
+        )
+        session.add(path)
+        await session.commit()
+        return path.id
+
+
+async def get_active_learning_path(user_telegram_id: int):
+    user = await get_user(user_telegram_id)
+    if not user:
+        return None
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(LearningPath).where(
+                LearningPath.user_id == user.id,
+                LearningPath.is_active == True
+            ).order_by(LearningPath.created_at.desc())
+        )
+        return result.scalar_one_or_none()
+
+
+async def deactivate_learning_path(path_id: int):
+    async with AsyncSessionLocal() as session:
+        stmt = update(LearningPath).where(LearningPath.id == path_id).values(is_active=False)
+        await session.execute(stmt)
+        await session.commit()
+
+
+# ---------- Progress ----------
+async def create_or_get_progress(user_telegram_id: int, path_id: int) -> UserProgress:
+    user = await get_user(user_telegram_id)
+    if not user:
+        user = await create_user(user_telegram_id)
+    async with AsyncSessionLocal() as session:
+        # Проверяем, есть ли уже прогресс по этому пути
+        result = await session.execute(
+            select(UserProgress).where(
+                UserProgress.user_id == user.id,
+                UserProgress.path_id == path_id
+            )
+        )
+        progress = result.scalar_one_or_none()
+        if not progress:
+            progress = UserProgress(
+                user_id=user.id,
+                path_id=path_id,
+                current_topic_index=0,
+                completed_topics=json.dumps([])
+            )
+            session.add(progress)
+            await session.commit()
+        return progress
+
+
+async def update_progress(user_telegram_id: int, path_id: int, current_topic_index: int = None, completed_topics: list = None, is_finished: bool = None):
+    user = await get_user(user_telegram_id)
+    if not user:
+        return
+    async with AsyncSessionLocal() as session:
+        stmt = update(UserProgress).where(
+            UserProgress.user_id == user.id,
+            UserProgress.path_id == path_id
+        )
+        updates = {}
+        if current_topic_index is not None:
+            updates['current_topic_index'] = current_topic_index
+        if completed_topics is not None:
+            updates['completed_topics'] = json.dumps(completed_topics)
+        if is_finished is not None:
+            updates['is_finished'] = is_finished
+        updates['last_activity'] = datetime.datetime.utcnow()
+        if updates:
+            await session.execute(stmt.values(**updates))
+            await session.commit()
+
+
+async def get_progress(user_telegram_id: int, path_id: int) -> UserProgress | None:
+    user = await get_user(user_telegram_id)
+    if not user:
+        return None
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(UserProgress).where(
+                UserProgress.user_id == user.id,
+                UserProgress.path_id == path_id
+            )
+        )
+        return result.scalar_one_or_none()
