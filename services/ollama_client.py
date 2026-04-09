@@ -81,11 +81,11 @@ async def generate_theory(topic: str) -> str:
 
 async def verify_answer(question: Question, user_answer: str) -> VerificationResult:
     prompt = f"""Вопрос: {question.question}
-Правильный ответ: {question.correct_answer}
-Ответ пользователя: {user_answer}
+    Правильный ответ: {question.correct_answer}
+    Ответ пользователя: {user_answer}
 
-Определи, правильный ли ответ (или частично). Верни JSON:
-{{"correct": true/false, "explanation": "краткий отзыв на русском"}}"""
+    Определи, правильный ли ответ. Если ответ пользователя означает «не знаю», «затрудняюсь ответить», «не уверен», «не помню» или очень короткий (менее 3 слов) – считай ответ неправильным. Верни JSON:
+    {{"correct": true/false, "explanation": "краткий отзыв на русском"}}"""
     payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "format": "json"}
     async with aiohttp.ClientSession() as session:
         async with session.post(OLLAMA_URL, json=payload) as resp:

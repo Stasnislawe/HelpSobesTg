@@ -30,6 +30,8 @@ class User(Base):
     attempts = relationship("QuizAttempt", back_populates="user")
     answers = relationship("Answer", back_populates="user")
     mistakes = relationship("UserMistake", back_populates="user")
+    learning_paths = relationship("LearningPath", back_populates="user")
+    progress = relationship("UserProgress", back_populates="user")
 
 
 class QuizAttempt(Base):
@@ -57,3 +59,28 @@ class Answer(Base):
     answered_at = Column(DateTime, default=datetime.datetime.utcnow)
     user = relationship("User", back_populates="answers")
     attempt = relationship("QuizAttempt", back_populates="answers")
+
+
+class LearningPath(Base):
+    __tablename__ = 'learning_paths'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    title = Column(String, nullable=True)          # опциональное название
+    topics = Column(String)                         # JSON-список тем
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    is_active = Column(Boolean, default=True)       # активен ли трек
+    user = relationship("User", back_populates="learning_paths")
+
+
+class UserProgress(Base):
+    __tablename__ = 'user_progress'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    path_id = Column(Integer, ForeignKey('learning_paths.id'))
+    current_topic_index = Column(Integer, default=0)      # индекс текущей темы (0-based)
+    completed_topics = Column(String)                     # JSON-список индексов завершённых тем
+    started_at = Column(DateTime, default=datetime.datetime.utcnow)
+    last_activity = Column(DateTime, default=datetime.datetime.utcnow)
+    is_finished = Column(Boolean, default=False)
+    user = relationship("User", back_populates="progress")
+    path = relationship("LearningPath")

@@ -18,7 +18,7 @@ from services.db_service import (
     add_or_update_mistake, count_correct_answers_for_attempt
 )
 from utils.intent_parser import parse_intent
-from keyboards.inline import quiz_control_keyboard
+from keyboards.inline import quiz_control_keyboard, topic_completed_keyboard
 from models.schemas import QuizSessionData, Question
 from utils.helpers import safe_send, escape_markdown
 
@@ -47,6 +47,10 @@ async def handle_message(message: types.Message, state: FSMContext):
 
     current_state = await state.get_state()
     if current_state == QuizStates.waiting_for_sequential_answer.state:
+        # Игнорируем пустые или нетекстовые сообщения
+        if not message.text or not message.text.strip():
+            await safe_send(message, "⚠️ Пожалуйста, напишите текстовый ответ на вопрос. Пустые сообщения не принимаются.")
+            return
         await process_sequential_answer(message, state)
         return
 
@@ -131,6 +135,7 @@ async def start_sequential_quiz(message: types.Message, state: FSMContext, sessi
     text = f"*Вопрос 1 из {total}:*\n\n{q.question}"
     safe_text = escape_markdown(text)
     await safe_send(message, safe_text, parse_mode="MarkdownV2", reply_markup=quiz_control_keyboard())
+    await safe_send(message, "✏️ Напишите ваш ответ текстом. Чтобы прервать тест, нажмите кнопку 'Завершить тест' или используйте /cancel.")
     await state.set_state(QuizStates.waiting_for_sequential_answer)
 
 
@@ -141,8 +146,13 @@ async def process_sequential_answer(message: types.Message, state: FSMContext):
     current_index = session_data.current_index
     question = session_data.questions[current_index]
 
+    user_answer = message.text.strip()
+    if len(user_answer) < 2:
+        await safe_send(message, "⚠️ Слишком короткий ответ. Пожалуйста, напишите развёрнутый ответ.")
+        return
+
     try:
-        result = await verify_answer(question, message.text)
+        result = await verify_answer(question, user_answer)
     except Exception as e:
         logger.exception("Verification failed")
         await safe_send(message, "❌ Ошибка при проверке ответа. Пожалуйста, попробуйте ещё раз.")
@@ -158,16 +168,11 @@ async def process_sequential_answer(message: types.Message, state: FSMContext):
     )
 
     if not result.correct:
-        await add_or_update_mistake(
-            message.from_user.id,
-            question.question,
-            question.correct_answer,
-            session_data.topic
-        )
-
-    # Отправляем результат без Markdown (чтобы избежать ошибок парсинга)
-    result_text = f"{'✅' if result.correct else '❌'} Результат:\n{result.explanation}"
-    await safe_send(message, result_text, parse_mode=None)
+        await safe_send(message,
+                        f"❌ Неправильно.\n\n✅ *Правильный ответ:*\n{question.correct_answer}\n\n{result.explanation}",
+                        parse_mode="MarkdownV2")
+    else:
+        await safe_send(message, f"✅ Верно!\n{result.explanation}", parse_mode=None)
 
     next_index = current_index + 1
     if next_index < len(session_data.questions):
@@ -184,13 +189,21 @@ async def process_sequential_answer(message: types.Message, state: FSMContext):
 async def finish_quiz(message: types.Message, state: FSMContext, session_data: QuizSessionData, attempt_id: int):
     correct_count = await count_correct_answers_for_attempt(attempt_id)
     await finish_quiz_attempt(attempt_id, correct_count)
-    await state.clear()
-
     total = len(session_data.questions)
     percent = (correct_count / total * 100) if total > 0 else 0
-    await safe_send(message, f"✅ Тест завершён!\n"
-                             f"Правильных ответов: {correct_count} из {total} ({percent:.1f}%)\n"
-                             f"Используйте /stats для просмотра общей статистики.")
+
+    data = await state.get_data()
+    learning_mode = data.get("learning_mode")
+    if learning_mode:
+        # Сохраняем данные обучения, но чистим только данные викторины
+        await state.update_data(quiz=None)  # удаляем данные викторины
+        await safe_send(message, f"✅ Тема пройдена!\nПравильных ответов: {correct_count} из {total} ({percent:.1f}%)", reply_markup=topic_completed_keyboard())
+        await state.update_data(topic_completed=True)
+        # Не очищаем всё состояние, чтобы сохранить learning_mode, path_id, topic_idx
+    else:
+        await safe_send(message, f"✅ Тест завершён!\nПравильных ответов: {correct_count} из {total} ({percent:.1f}%)\nИспользуйте /stats для просмотра общей статистики.")
+        await state.clear()  # только для обычного теста
+
 
 @router.callback_query(lambda c: c.data == "finish_quiz", StateFilter(QuizStates.waiting_for_sequential_answer))
 async def finish_quiz_callback(callback: CallbackQuery, state: FSMContext):
