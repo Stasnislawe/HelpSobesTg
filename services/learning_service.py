@@ -2,6 +2,7 @@ import json
 import logging
 from typing import List
 from services.ollama_client import clean_json_response
+from models.schemas import Question
 from config import OLLAMA_URL, OLLAMA_MODEL
 import aiohttp
 

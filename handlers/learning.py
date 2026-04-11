@@ -1,17 +1,51 @@
+import json
 import logging
 from aiogram import Router, types
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from services.learning_service import generate_topics_pool
-from services.db_service import create_learning_path, get_active_learning_path, deactivate_learning_path, create_or_get_progress
-from utils.helpers import safe_send
+
+from services.learning_service import generate_topics_pool, generate_topic_theory, generate_topic_questions
+from services.db_service import (
+    create_learning_path, get_active_learning_path, deactivate_learning_path,
+    create_or_get_progress, get_progress, update_progress,
+    get_learning_path_by_id, get_user, create_quiz_attempt
+)
+from keyboards.inline import learning_keyboard, topic_completed_keyboard
+from handlers.quiz import start_quiz_session
+from models.schemas import QuizSessionData, Question
+from utils.helpers import safe_send, escape_markdown
 
 
 router = Router()
 logger = logging.getLogger(__name__)
 
 
+class LearningStates(StatesGroup):
+    waiting_for_theory = State()
+    waiting_for_questions = State()
+
+
+# ---------- Команды ----------
 @router.message(Command("start_learning"))
+async def cmd_start_learning(message: types.Message, state: FSMContext):
+    path = await get_active_learning_path(message.from_user.id)
+    if not path:
+        await safe_send(message, "У вас нет активного учебного плана. Создайте его через `/gp`.")
+        return
+    progress = await get_progress(message.from_user.id, path.id)
+    if not progress:
+        progress = await create_or_get_progress(message.from_user.id, path.id)
+    if progress.is_finished:
+        await safe_send(message, "Вы уже завершили обучение по этому плану. Для повторного прохождения создайте новый план через `/gp`.")
+        return
+    topics = json.loads(path.topics)
+    current_idx = progress.current_topic_index
+    if current_idx >= len(topics):
+        await safe_send(message, "Поздравляю! Вы прошли все темы. Используйте `/final_test` для итоговой проверки.")
+        return
+    await show_topic(message, state, path.id, topics, current_idx, progress)
 
 
 @router.message(Command("gp"))
@@ -62,6 +96,127 @@ async def cmd_generate_pool(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="❌ Отклонить", callback_data="reject_pool")]
     ])
     await safe_send(message, f"📚 *Предлагаемый учебный план:*\n\n{topics_text}\n\nВам нравится?", parse_mode="MarkdownV2", reply_markup=keyboard)
+
+
+@router.message(Command("progress"))
+async def cmd_progress(message: types.Message):
+    path = await get_active_learning_path(message.from_user.id)
+    if not path:
+        await safe_send(message, "Нет активного обучения. Создайте план через `/gp`.")
+        return
+    progress = await get_progress(message.from_user.id, path.id)
+    if not progress:
+        await safe_send(message, "Вы ещё не начали обучение. Используйте `/start_learning`.")
+        return
+    topics = json.loads(path.topics)
+    completed = json.loads(progress.completed_topics) if progress.completed_topics else []
+    current = progress.current_topic_index
+    total = len(topics)
+    percent = (len(completed) / total * 100) if total else 0
+    bar_length = 10
+    filled = int(bar_length * len(completed) / total) if total else 0
+    bar = "█" * filled + "░" * (bar_length - filled)
+    text = f"📊 *Ваш прогресс*\n\n{bar} {percent:.0f}%\n"
+    text += f"Пройдено тем: {len(completed)} из {total}\n"
+    if current < total:
+        text += f"Текущая тема: {topics[current]}\n"
+    else:
+        text += "🎉 Все темы пройдены! Используйте `/final_test`"
+    await safe_send(message, text, parse_mode="MarkdownV2")
+
+
+# ---------- Вспомогательные функции ----------
+async def show_topic(message: types.Message, state: FSMContext, path_id: int, topics: list, topic_idx: int, progress):
+    topic = topics[topic_idx]
+    await safe_send(message, f"📚 *Тема {topic_idx+1} из {len(topics)}: {topic}*", parse_mode="MarkdownV2")
+    progress_msg = await safe_send(message, f"Генерирую теорию по теме «{topic}»...")
+    theory = await generate_topic_theory(topic)
+    await progress_msg.delete()
+    await safe_send(message, theory, parse_mode=None)
+    await state.update_data(current_path_id=path_id, current_topic_idx=topic_idx, current_topic=topic)
+    keyboard = learning_keyboard(topic_idx, len(topics), has_next=False)
+    await safe_send(message, "Когда будете готовы, нажмите «Задать вопросы»", reply_markup=keyboard)
+    await state.set_state(LearningStates.waiting_for_theory)
+
+
+@router.callback_query(lambda c: c.data == "ask_questions", StateFilter(LearningStates.waiting_for_theory))
+async def ask_questions(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    path_id = data.get("current_path_id")
+    topic_idx = data.get("current_topic_idx")
+    topic = data.get("current_topic")
+    if not path_id:
+        await callback.answer("Ошибка: не найден учебный план")
+        return
+    path = await get_learning_path_by_id(path_id)
+    if not path:
+        await callback.answer("План не найден")
+        return
+    topics = json.loads(path.topics)
+    mistakes = await get_user_mistakes(callback.from_user.id, topic, limit=10)
+    progress = await get_progress(callback.from_user.id, path_id)
+    completed = json.loads(progress.completed_topics) if progress.completed_topics else []
+    previous_questions = []  # можно доработать
+    await callback.answer("Генерирую вопросы...")
+    progress_msg = await safe_send(callback.message, f"Генерирую вопросы по теме «{topic}»...")
+    questions = await generate_topic_questions(topic, count=5, previous_questions=previous_questions, user_mistakes=mistakes)
+    await progress_msg.delete()
+    if not questions:
+        await safe_send(callback.message, "Не удалось сгенерировать вопросы. Попробуйте ещё раз.")
+        return
+    user = await get_user(callback.from_user.id)
+    attempt_id = await create_quiz_attempt(callback.from_user.id, topic, len(questions))
+    session_data = QuizSessionData(
+        user_id=callback.from_user.id,
+        questions=questions,
+        mode=user.mode,
+        current_index=0,
+        attempt_id=attempt_id,
+        topic=topic
+    )
+    await state.update_data(quiz=session_data.dict(), learning_mode=True, path_id=path_id, topic_idx=topic_idx)
+    await start_quiz_session(callback.message, state, session_data)
+    await callback.message.delete()
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "next_topic")
+async def next_topic(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    path_id = data.get("path_id") or data.get("current_path_id")
+    topic_idx = data.get("topic_idx") or data.get("current_topic_idx")
+    if not path_id:
+        await callback.answer("Ошибка: не найден план")
+        return
+    path = await get_learning_path_by_id(path_id)
+    topics = json.loads(path.topics)
+    next_idx = topic_idx + 1
+    if next_idx < len(topics):
+        progress = await get_progress(callback.from_user.id, path_id)
+        completed = json.loads(progress.completed_topics) if progress.completed_topics else []
+        if topic_idx not in completed:
+            completed.append(topic_idx)
+        await update_progress(callback.from_user.id, path_id, current_topic_index=next_idx, completed_topics=completed)
+        await show_topic(callback.message, state, path_id, topics, next_idx, progress)
+        await callback.message.delete()
+        await callback.answer()
+    else:
+        progress = await get_progress(callback.from_user.id, path_id)
+        completed = json.loads(progress.completed_topics) if progress.completed_topics else []
+        if topic_idx not in completed:
+            completed.append(topic_idx)
+        await update_progress(callback.from_user.id, path_id, is_finished=True, completed_topics=completed)
+        await safe_send(callback.message, "🎉 Поздравляю! Вы прошли все темы. Теперь можете пройти итоговый тест командой `/final_test`.")
+        await callback.message.delete()
+        await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "abort_learning")
+async def abort_learning(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_send(callback.message, "Обучение прервано. Вы можете начать заново через `/start_learning`.")
+    await callback.message.delete()
+    await callback.answer()
 
 
 @router.callback_query(lambda c: c.data == "approve_pool")
